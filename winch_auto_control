@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+
+
+import sys
+import threading
+import time
+import pigpio
+import math
+
+# =====================
+#   ウインチ設定 (ハードウェア定数)
+# =====================
+PIN                = 18
+STOP_fwd           = 1440
+STOP_center        = 1400
+STOP_rev           = 1370
+
+
+PWM_FWD_MIN        = 1455   # 正転の最小値 (1%)
+PWM_FWD_MAX        = 1800   # 正転の最大値 (100%)
+PWM_REV_MAX        = 1345   # 逆転の最小値 (1% - 数字が大きいほど遅い)
+PWM_REV_MIN        = 1000   # 逆転の最大値 (100% - 数字が小さいほど速い)
+
+
+ESTIMATED_ROT_PER_SEC = 0.2 # RPS
+WINCH_RADIUS = 0.10         # ドラム半径 (10cm)
+
+MAX_SPEED_M_MIN = 15.0
+
+# ==========================================
+# 1. サーバーデータ (受信データ)
+# ==========================================
+class ServerCommand:
+    def __init__(self):
+        self.run_flag = False      # False = 停止, True = 動作中
+        self.target_depth_m = 0.0  # 目標深度 (m)
+        self.rate = 20             # 要求速度 (0-100%)
+
+# ==========================================
+# 2. ウィンチ状態 (送信データ)
+# ==========================================
+class WinchStatus:
+    def __init__(self):
+        self.run_flag = False              # False = 完全停止, True = 動作中（または減速中）
+        self.current_depth_m = 0.0         # 現在の深度
+        self.depth_estimated_flag = False  # (is_estimated) --> False = センサー計測, True = 回転数による推定
+        self.speed = 0.0                   # 現在の速度
+        self.state_name = "IDLE"           # 現在の状態 (IDLE, TRACKING, SOFT_STOP, RETRIEVE_TO_HOME)
+
+# ==========================================
+# 3.  (テスト用)サーバ
+# ==========================================
+def mock_server_interface(command_data):
+    """
+    ネットワークサーバーをシミュレートできます。
+    """
+    print("\n--- サーバーシミュレーター起動 ---")
+    print("使用可能なコマンド :")
+    print("  'start 15' -> 15m地点へウィンチを始動 (run_flag=True, target=15)")
+    print("  'stop'     -> ウィンチを停止 (run_flag=False)")
+    print("  'home'     -> 0mまで巻き上げ (run_flag=True, target=0)")
+    print("  'quit'     -> プログラムを終了")
+    
+    while True:
+        try:
+            user_input = input("\n[Server] > ").strip().lower()
+            
+            if user_input == 'quit':
+                # システムを終了させるために特殊な値を代入
+                command_data.run_flag = "QUIT"
+                break
+                
+            elif user_input == 'stop':
+                command_data.run_flag = False
+                print("[Server] 送信 : 停止 (run_flag=False)")
+                
+            elif user_input == 'home':
+                command_data.run_flag = True
+                command_data.target_depth_m = 0.0
+                print("[Server] 送信 : ホーム復帰 (run_flag=True, target=0.0)")
+                
+            elif user_input.startswith('start '):
+                parts = user_input.split()
+                if len(parts) >= 2:
+                    command_data.target_depth_m = float(parts[1])
+                    if len(parts) >= 3:
+                        command_data.rate = int(parts[2])
+                    command_data.run_flag = True
+                    print(f"[Server] 送信 : {command_data.target_depth_m}mへ移動開始 (速度: {command_data.rate}%)")
+            else:
+                print("認識されないコマンドです。")
+                
+        except Exception as e:
+            print(f"入力エラー : {e}")
+
+# ==========================================
+# 4. ウィンチコントローラー (メインロジック)
+# ==========================================
+class WinchControllerV1:
+    def __init__(self):
+        self.cmd = ServerCommand()
+        self.status = WinchStatus()
+
+        # シミュレーション用の内部変数（後で本物のLiDARの値に置き換える）
+        self._simulated_actual_depth = 5.0
+
+        # =====================
+        #   pigpio 初期化 & モーター変数
+        # =====================
+
+        self.pi = pigpio.pi()
+        if not self.pi.connected:
+            print("pigpiod が起動していません: sudo pigpiod")
+            sys.exit()
+
+
+        self.running = True
+        self.emergency = False          # 緊急停止フラグ
+        self.target_pwm = STOP_center   # 目標の速度
+        self.current_pwm = STOP_center  # 現在のモーターの速度
+        self.num_rotations = 0.0
+        self.reached_full_speed = False #SLOW_down用
+
+        # モーター制御用のスレッドを開始
+        threading.Thread(target=self.motor_loop, daemon=True).start()
+        
+        # arming (必須)
+        """
+        理由：DATASHEET Safety features : Every time SmartDriveDuo-30 is power up, the input data must be "stop" 
+        (for RC, Analog, PWM input mode). This feature prevent the driver from sudden run, especially when the
+        driver accidently reset.
+        """
+        self.pi.set_servo_pulsewidth(PIN, STOP_center)
+        time.sleep(0.5)  # ESCアーミング待ち
+
+    # =====================
+    #   速度(%)をPWM値に変換する関数
+    # =====================
+    def calculate_pwm(self, direction, rate_percent):
+        # サーバーからの速度指定が0以下の場合は停止
+        if rate_percent <= 0:
+            return STOP_center
+        # 100%を超えないようにする
+        if rate_percent > 100:
+            rate_percent = 100
+        # パーセントを計算用の小数(0.01 〜 1.00)にする
+        ratio = rate_percent / 100.0
+        if direction == 'fwd': # 巻き上げ
+            # 1455 から 2000 の間で割合を計算
+            return int(PWM_FWD_MIN + (PWM_FWD_MAX - PWM_FWD_MIN) * ratio)
+        elif direction == 'rev': # 繰り出し
+            # 1345 から 1200 の間で割合を計算 (逆転は数値が下がるほど速いので引き算)
+            return int(PWM_REV_MAX - (PWM_REV_MAX - PWM_REV_MIN) * ratio)
+        return STOP_center
+
+
+    # =====================
+    #   モータースレッド（滑らかな加減速を行う「筋肉」）
+    # =====================
+    def motor_loop(self):
+        while self.running:
+            if self.emergency:
+                self.current_pwm = STOP_center
+                self.pi.set_servo_pulsewidth(PIN, STOP_center)
+                time.sleep(0.1)
+                continue
+            # 目標と現在の差をチェックして、5、または20ずつ近づける
+            if self.target_pwm in [STOP_center, STOP_fwd, STOP_rev]:
+                step = 1  #素早く停止
+                
+            else:
+                step = 1   #ゆっくり加速
+            
+            if self.current_pwm < self.target_pwm:
+                if self.target_pwm >= STOP_fwd and (STOP_rev <= self.current_pwm < STOP_fwd):
+                    self.current_pwm = STOP_fwd
+                else:
+                    self.current_pwm = min(self.current_pwm + step, self.target_pwm)
+
+                self.pi.set_servo_pulsewidth(PIN, self.current_pwm)
+
+
+            elif self.current_pwm > self.target_pwm:
+                if self.target_pwm <= STOP_rev and (STOP_rev < self.current_pwm <= STOP_fwd):
+                    self.current_pwm = STOP_rev
+                else:
+                    self.current_pwm = max(self.current_pwm - step, self.target_pwm)
+
+                self.pi.set_servo_pulsewidth(PIN, self.current_pwm)
+
+
+            if self.current_pwm > STOP_fwd:
+                self.num_rotations -= (ESTIMATED_ROT_PER_SEC * 0.02)
+            elif self.current_pwm < STOP_rev:
+                self.num_rotations += (ESTIMATED_ROT_PER_SEC * 0.02)  
+                
+            if self.num_rotations < 0:
+                self.num_rotations = 0.0
+            
+            time.sleep(0.02)   
+            
+        
+    def get_simulated_depth(self):
+        # 回転数から水深を物理的に計算 (2 * π * r * 回転数)
+        perimeter = 2 * math.pi * WINCH_RADIUS
+        return round(self.num_rotations * perimeter, 2)
+    
+    # =========================================
+    #   メインループ (サーバー指令とPWM制御の架け橋)
+    # =========================================
+
+    def run(self):
+        # 疑似サーバーを別スレッドで実行
+        server_thread = threading.Thread(target=mock_server_interface, args=(self.cmd,), daemon=True)
+        server_thread.start()
+        
+        print("ウィンチ待機中...")
+
+        # メインループ (状態遷移マシン)
+        while self.running :
+            # 終了処理            
+            if self.cmd.run_flag == "QUIT":
+                print("システムを終了します...")
+                break
+
+            # 現在の深度を取得 (今はシミュレーション、本番は get_depth_sonar() 等を使う)
+            self.status.current_depth_m = self.get_simulated_depth()
+
+            # ---------------------------------------------------------
+            # 状態遷移マシン
+            # ---------------------------------------------------------
+            
+            if not self.cmd.run_flag: # サーバーから停止要求があった場合
+                # 完全に停止(1400)するまで SOFT_STOP を維持する
+                if self.current_pwm != STOP_center:
+                    self.status.state_name = "SOFT_STOP"
+                    self.status.run_flag = True # 物理的に停止するまではTrueを維持
+                    # モーターに停止を指示 (実際の滑らかな減速はmotor_loopが行う)
+                    self.target_pwm = STOP_center 
+                    
+                else:
+                    self.status.state_name = "IDLE"
+                    self.status.run_flag = False # 完全に停止
+                    self.target_pwm = STOP_center # 念のため停止を維持
+                    self.reached_full_speed = False  #IDLEに戻った時にリセット
+                    
+            elif self.cmd.run_flag:
+                # サーバーから動作要求があった場合
+                if self.cmd.target_depth_m == 0:
+                    self.status.state_name = "RETRIEVE_TO_HOME"
+                    self.status.run_flag = True
+
+                    depth = self.status.current_depth_m
+                    slowdown_zone = 2.0
+
+                    # リミットスイッチまで巻き上げるコード
+                    # これはシミュレーション
+                    limit_switch_pressed = (depth <= 0.1)
+
+                    if limit_switch_pressed:
+                        self.target_pwm = STOP_center
+                        self.cmd.run_flag = False
+                        self.num_rotations = 0.0
+                        self.status.current_depth_m = 0.0
+                    else:
+                        # 残りの距離によって速度が変わる
+                        if depth > slowdown_zone:
+                            self.target_pwm = self.calculate_pwm('fwd', self.cmd.rate)
+                        else:
+                            self.target_pwm = self.calculate_pwm('fwd', 1)
+                    
+                    
+                else :
+                    self.status.state_name = "TRACKING"
+                    self.status.run_flag = True
+                    target = self.cmd.target_depth_m
+                    depth = self.status.current_depth_m
+                    diff = target - depth
+                    abs_diff = abs(diff)
+
+                    tolerance = 0.2  # 許容誤差（0.2m以内に来たら停止）
+                    slowdown_zone = 2.0
+                    
+                    if abs(diff) <= tolerance:
+                        self.target_pwm = STOP_center
+                        self.cmd.run_flag = False
+                        
+                    else:
+                        # === 2段階制御  ===
+                        if abs_diff <= slowdown_zone:
+                            # 減速ゾーン: どんな速度で来ていても、安全な最低速度(クリープ速度)固定
+                            active_rate =  1
+                            if self.reached_full_speed:  # 一度でも全速で走ったことがある場合のみ
+                                self.status.state_name = "SLOW_DOWN"
+                            else:
+                                self.status.state_name = "TRACKING"
+                        else:
+                            # 通常ゾーン: サーバーからの要求速度
+                            active_rate = self.cmd.rate
+                            self.reached_full_speed = True    # 通常ゾーンを通過した記録
+                            self.status.state_name = "TRACKING"
+
+                        # 決定した速度(active_rate)でモーターに指示を出す
+                        if diff > 0:
+                            self.target_pwm = self.calculate_pwm('rev', active_rate) 
+                        elif diff < 0:
+                            self.target_pwm = self.calculate_pwm('fwd', active_rate)
+
+            # ---------------------------------------------------------
+            # 実際のPWMからリアルタイムな速度を計算する
+            # ---------------------------------------------------------
+            if self.current_pwm == STOP_center:
+                self.status.speed = 0
+            else:
+                # 加速中も減速中も、実際のモーターのPWMを見て速度を逆算する
+                approx_rate = abs(self.current_pwm - STOP_center) / 600.0
+                self.status.speed = int(approx_rate * (MAX_SPEED_M_MIN * 10))
+
+            # 状態の表示 (サーバーへ返送されるデータのシミュレーション)
+            print(f"\r\033[K[Winch] 状態: {self.status.state_name:<15} | PWM: {self.current_pwm} | 深度: {self.status.current_depth_m:>5.2f}m | 目標: {self.cmd.target_depth_m:>5.2f}m  | 速度: {self.status.speed}", end="", flush=True)            
+            
+            time.sleep(0.1) # テスト用に毎秒2回ループ
+
+    # プログラム終了時の安全な後処理
+    def cleanup(self):
+        self.running = False
+        time.sleep(0.5)
+        if hasattr(self, 'pi') and self.pi.connected:
+            self.pi.set_servo_pulsewidth(PIN, STOP_center)
+            time.sleep(0.5)
+            self.pi.set_servo_pulsewidth(PIN, 0)
+            self.pi.stop()
+        print("\r\nハードウェアを安全に停止しました。\r\n")
+
+
+
+if __name__ == "__main__":
+    app = WinchControllerV1()
+    try:
+        app.run()
+    finally:
+        app.cleanup()
