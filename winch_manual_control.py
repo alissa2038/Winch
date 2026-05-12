@@ -19,7 +19,6 @@ import time
 import smbus
 import select as _select
 import math
-import random
 
 # =====================
 #   ウインチ設定 (Constantes globales)
@@ -35,12 +34,6 @@ PWM_FWD_MAX        = 2000   # 正転の最大値
 PWM_REV_MIN        = 1000   # 逆転の最小値
 PWM_REV_MAX        = 1345   # 逆転の最大値
 SPEED_STEP         = 10     # q/a で変化する速度ステップ (us)
-
-# =====================
-#   ケーブル設定
-# =====================
-WINCH_RADIUS = 0.10   # ウインチの半径　10 cm
-CABLE_LENGTH_MAX = 150.0    # 全体のケーブル長
 
 # =====================
 #   センサー設定
@@ -82,10 +75,6 @@ class WinchController:
         self.current_pwm = STOP_center  # 現在のモーターの速度
 
         self.sensor_connected = False
-        self.num_rotations = 0.0   # ウインチの合計回転数
-
-        self.dropout_end_time = 0   # 震度シミュレーション
-        self.next_dropout_time = time.time() + 10.0  # 最初の途切れは10秒後
 
         # スレッドの開始 
         threading.Thread(target=self.sensor_loop, daemon=True).start()
@@ -192,9 +181,7 @@ class WinchController:
                 else:
                     self.current_pwm = max(self.current_pwm - step, self.target_pwm)
                 self.pi.set_servo_pulsewidth(PIN, self.current_pwm)
-                
-            if self.num_rotations < 0:   # マイナスにはならないようにする
-                self.num_rotations = 0.0
+              
             
             # 0.02秒待つ（1秒間に50回更新 ＝ 滑らか)
             time.sleep(0.02)
