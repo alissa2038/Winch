@@ -192,11 +192,6 @@ class WinchController:
                 else:
                     self.current_pwm = max(self.current_pwm - step, self.target_pwm)
                 self.pi.set_servo_pulsewidth(PIN, self.current_pwm)
-
-            if self.current_pwm > STOP_fwd:
-                self.num_rotations -= (ESTIMATED_ROT_PER_SEC * 0.02)  #繰り出し＝回転数減る
-            elif self.current_pwm < STOP_rev:
-                self.num_rotations += (ESTIMATED_ROT_PER_SEC * 0.02)  
                 
             if self.num_rotations < 0:   # マイナスにはならないようにする
                 self.num_rotations = 0.0
