@@ -253,7 +253,6 @@ class WinchController:
         print(f"\r  │  【↑】        巻き取り   【↓】 繰り出し         │\r\n")
         print(f"\r  │  【スペース】 一時停止                          │\r\n")
         print(f"\r  │  【q / a】    速度変更                          │\r\n")
-        print(f"\r  │  【b】        戻る                              │\r\n")
         print(f"\r  │  【s】        終了                              │\r\n")
         print(f"\r  └─────────────────────────────────────────────────┘\r\n")
         print(f"\r\n  ■ 停止 (方向キーを押して制御スタート) ", end='', flush=True)
@@ -265,11 +264,6 @@ class WinchController:
                 self.target_pwm = STOP_center
                 self.current_direction = None
                 return 'quit'
-            
-            elif key == 'b':  #メニューに戻る
-                self.target_pwm = STOP_center
-                self.current_direction = None
-                return 'menu'
             
             elif key == ' ':  # 一時停止
                 if self.current_direction is not None:
