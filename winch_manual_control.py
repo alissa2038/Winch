@@ -345,33 +345,9 @@ class WinchController:
     # =====================
     def run(self):
         while True:
-            time.sleep(0.1)
-
-            print(f"\r\n\n\n\n  ========================\r\n")
-            if self.sensor_connected:
-                print(f"\r\n  📡 LiDARセンサー : [✅ 接続済み] (緊急停止有効)\r\n")
-            else:
-                print(f"\r\n  ⚠️ LiDARセンサー : [❌ 未接続] (緊急停止無効)\r\n")
-            print(f"\r\n ---- モードを選択してください ----\r\n")
-            print(f"\r  ┌──────────────────────────────┐\r\n")
-            print(f"\r  │  【1】 手動モード            │\r\n")
-            print(f"\r  │  【2】 自動モード            │\r\n")
-            print(f"\r  │  【s】 終了                  │\r\n")
-            print(f"\r  └──────────────────────────────┘\r\n")
-            print(f"\r\n  > ", end='', flush=True)
-
-            key = self.get_key()
-
-            if key == 's':
-                break
-            elif key == '1':
-                result = self.manual_mode()
-                if result == 'quit':
-                    break
-            elif key == '2':
-                result = self.auto_mode()
-                if result == 'quit':
-                    break
+          result = self.manual_mode()
+          if result == 'quit':
+              break
             
 
     def cleanup(self):
