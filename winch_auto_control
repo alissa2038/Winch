@@ -6,6 +6,9 @@ import threading
 import time
 import pigpio
 import math
+import socket
+import json
+import argparse
 
 # =====================
 #   ウインチ設定 (ハードウェア定数)
@@ -26,6 +29,9 @@ ESTIMATED_ROT_PER_SEC = 0.2 # RPS
 WINCH_RADIUS = 0.10         # ドラム半径 (10cm)
 
 MAX_SPEED_M_MIN = 15.0
+
+DEFAULT_PORT = 8090
+
 
 # ==========================================
 # 1. サーバーデータ (受信データ)
@@ -48,61 +54,146 @@ class WinchStatus:
         self.state_name = "IDLE"           # 現在の状態 (IDLE, TRACKING, SOFT_STOP, RETRIEVE_TO_HOME)
 
 # ==========================================
-# 3.  (テスト用)サーバ
+# 3.  TCP サーバー 
 # ==========================================
-def mock_server_interface(command_data):
+def tcp_server(controller, port):
     """
-    ネットワークサーバーをシミュレートできます。
+    TCPサーバーを起動し、クライアントからの NDJSON を受け付ける。
+    各クライアント接続は別スレッドで処理する。
     """
-    print("\n--- サーバーシミュレーター起動 ---")
-    print("使用可能なコマンド :")
-    print("  'start 15' -> 15m地点へウィンチを始動 (run_flag=True, target=15)")
-    print("  'stop'     -> ウィンチを停止 (run_flag=False)")
-    print("  'home'     -> 0mまで巻き上げ (run_flag=True, target=0)")
-    print("  'quit'     -> プログラムを終了")
-    
-    while True:
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # ポート再利用を許可（再起動時に "Address already in use" を防ぐ）
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.bind(("0.0.0.0", port))
+    server_sock.listen(5)
+    print(f"[TCP] ポート {port} で待機中...")
+ 
+    while controller.running:
         try:
-            user_input = input("\n[Server] > ").strip().lower()
-            
-            if user_input == 'quit':
-                # システムを終了させるために特殊な値を代入
-                command_data.run_flag = "QUIT"
-                break
-                
-            elif user_input == 'stop':
-                command_data.run_flag = False
-                print("[Server] 送信 : 停止 (run_flag=False)")
-                
-            elif user_input == 'home':
-                command_data.run_flag = True
-                command_data.target_depth_m = 0.0
-                print("[Server] 送信 : ホーム復帰 (run_flag=True, target=0.0)")
-                
-            elif user_input.startswith('start '):
-                parts = user_input.split()
-                if len(parts) >= 2:
-                    command_data.target_depth_m = float(parts[1])
-                    if len(parts) >= 3:
-                        command_data.rate = int(parts[2])
-                    command_data.run_flag = True
-                    print(f"[Server] 送信 : {command_data.target_depth_m}mへ移動開始 (速度: {command_data.rate}%)")
-            else:
-                print("認識されないコマンドです。")
-                
+            server_sock.settimeout(1.0)  # 1秒ごとにrunningフラグを確認
+            try:
+                conn, addr = server_sock.accept()
+            except socket.timeout:
+                continue
+            print(f"\n[TCP] 接続: {addr}")
+            t = threading.Thread(
+                target=handle_client,
+                args=(conn, addr, controller),
+                daemon=True
+            )
+            t.start()
         except Exception as e:
-            print(f"入力エラー : {e}")
+            if controller.running:
+                print(f"[TCP] サーバーエラー: {e}")
+ 
+    server_sock.close()
+    print("[TCP] サーバー終了")
+
+
+def handle_client(conn, addr, controller):
+    """
+    1クライアントとの通信を担当する。
+    NDJSON (改行区切りJSON) を受信し、レスポンスを返す。
+    """
+    buffer = ""
+    try:
+        with conn:
+            conn.settimeout(30.0)  # 30秒無通信でタイムアウト
+            while controller.running:
+                try:
+                    chunk = conn.recv(1024).decode("utf-8")
+                except socket.timeout:
+                    # タイムアウトしても接続は維持する
+                    continue
+ 
+                if not chunk:
+                    # クライアントが切断した
+                    break
+ 
+                buffer += chunk
+ 
+                # 改行が来るまでバッファに溜める (NDJSON)
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+ 
+                    response = process_command(line, controller)
+                    # レスポンスも NDJSON (末尾に改行)
+                    conn.sendall((response + "\n").encode("utf-8"))
+ 
+    except Exception as e:
+        print(f"\n[TCP] クライアント {addr} エラー: {e}")
+    finally:
+        print(f"\n[TCP] 切断: {addr}")
+
+ 
+def process_command(raw_json: str, controller) -> str:
+    """
+    受信した JSON 文字列を解析し、get / set を処理してレスポンス JSON を返す。
+    """
+    try:
+        data = json.loads(raw_json)
+    except json.JSONDecodeError as e:
+        return json.dumps({"status": "error", "error": f"JSON parse error: {e}"})
+ 
+    command = data.get("command")
+
+    # --------------------------------------------------
+    # GET: 現在のウィンチ状態を返す
+    # --------------------------------------------------
+    if command == "get":
+        status = controller.status
+        # depth: 精度0.1m → ×10 して uint16 で返す (例: 1.5m → 15)
+        depth_encoded = int(round(status.current_depth_m * 10))
+        # speed: 精度0.1m/min → ×10 して uint16 で返す
+        speed_encoded = int(status.speed)
+ 
+        response = {
+            "state":        1 if status.run_flag else 0,
+            "depth":        depth_encoded,
+            "is_estimated": 1 if status.depth_estimated_flag else 0,
+            "speed":        speed_encoded,
+        }
+        return json.dumps(response)
+
+    # --------------------------------------------------
+    # SET: ウィンチに指令を送る
+    # --------------------------------------------------
+    elif command == "set":
+        try:
+            state = int(data["state"])   # 0=停止, 1=稼働
+            # depth: ×10 エンコード値を受け取り、÷10 して実メートルに戻す (例: 20 → 2.0m)
+            depth_encoded = int(data["depth"])
+            rate  = int(data["rate"])    # 0〜100%
+ 
+            target_depth_m = depth_encoded / 10.0
+ 
+            # ServerCommand に反映
+            controller.cmd.run_flag      = (state == 1)
+            controller.cmd.target_depth_m = target_depth_m
+            controller.cmd.rate          = rate
+ 
+            return json.dumps({"status": "ok"})
+ 
+        except (KeyError, ValueError, TypeError) as e:
+            return json.dumps({"status": "error", "error": f"invalid set parameters: {e}"})
+ 
+    # --------------------------------------------------
+    # 不明なコマンド
+    # --------------------------------------------------
+    else:
+        return json.dumps({"status": "error", "error": f"unknown command: {command!r}"})
 
 # ==========================================
 # 4. ウィンチコントローラー (メインロジック)
 # ==========================================
 class WinchControllerV1:
-    def __init__(self):
+    def __init__(self, port=DEFAULT_PORT):
+        self.port = port
         self.cmd = ServerCommand()
         self.status = WinchStatus()
-
-        # シミュレーション用の内部変数（後で本物のLiDARの値に置き換える）
-        self._simulated_actual_depth = 5.0
 
         # =====================
         #   pigpio 初期化 & モーター変数
@@ -112,7 +203,6 @@ class WinchControllerV1:
         if not self.pi.connected:
             print("pigpiod が起動していません: sudo pigpiod")
             sys.exit()
-
 
         self.running = True
         self.emergency = False          # 緊急停止フラグ
@@ -155,7 +245,7 @@ class WinchControllerV1:
 
 
     # =====================
-    #   モータースレッド（滑らかな加減速を行う「筋肉」）
+    #   モータースレッド（滑らかな加減速）
     # =====================
     def motor_loop(self):
         while self.running:
@@ -176,16 +266,13 @@ class WinchControllerV1:
                     self.current_pwm = STOP_fwd
                 else:
                     self.current_pwm = min(self.current_pwm + step, self.target_pwm)
-
                 self.pi.set_servo_pulsewidth(PIN, self.current_pwm)
-
 
             elif self.current_pwm > self.target_pwm:
                 if self.target_pwm <= STOP_rev and (STOP_rev < self.current_pwm <= STOP_fwd):
                     self.current_pwm = STOP_rev
                 else:
                     self.current_pwm = max(self.current_pwm - step, self.target_pwm)
-
                 self.pi.set_servo_pulsewidth(PIN, self.current_pwm)
 
 
@@ -210,21 +297,21 @@ class WinchControllerV1:
     # =========================================
 
     def run(self):
-        # 疑似サーバーを別スレッドで実行
-        server_thread = threading.Thread(target=mock_server_interface, args=(self.cmd,), daemon=True)
+        # TCP サーバーを別スレッドで起動 
+        server_thread = threading.Thread(
+            target=tcp_server,
+            args=(self, self.port),
+            daemon=True
+        )
         server_thread.start()
-        
-        print("ウィンチ待機中...")
+ 
+        print("ウィンチ待機中... (Ctrl+C で終了)")
 
-        # メインループ (状態遷移マシン)
-        while self.running :
-            # 終了処理            
-            if self.cmd.run_flag == "QUIT":
-                print("システムを終了します...")
-                break
-
-            # 現在の深度を取得 (今はシミュレーション、本番は get_depth_sonar() 等を使う)
+        # メインループ 
+        while self.running:
             self.status.current_depth_m = self.get_simulated_depth()
+            # 推定フラグ: 今はすべて推定値 (LiDAR実装後に切り替える)
+            self.status.depth_estimated_flag = True
 
             # ---------------------------------------------------------
             # 状態遷移マシン
@@ -252,9 +339,7 @@ class WinchControllerV1:
 
                     depth = self.status.current_depth_m
                     slowdown_zone = 2.0
-
                     # リミットスイッチまで巻き上げるコード
-                    # これはシミュレーション
                     limit_switch_pressed = (depth <= 0.1)
 
                     if limit_switch_pressed:
@@ -317,7 +402,14 @@ class WinchControllerV1:
                 self.status.speed = int(approx_rate * (MAX_SPEED_M_MIN * 10))
 
             # 状態の表示 (サーバーへ返送されるデータのシミュレーション)
-            print(f"\r\033[K[Winch] 状態: {self.status.state_name:<15} | PWM: {self.current_pwm} | 深度: {self.status.current_depth_m:>5.2f}m | 目標: {self.cmd.target_depth_m:>5.2f}m  | 速度: {self.status.speed}", end="", flush=True)            
+            print(
+                f"\r\033[K[Winch] 状態: {self.status.state_name:<15} | "
+                f"PWM: {self.current_pwm} | "
+                f"深度: {self.status.current_depth_m:>5.2f}m | "
+                f"目標: {self.cmd.target_depth_m:>5.2f}m | "
+                f"速度: {self.status.speed}",
+                end="", flush=True
+            )
             
             time.sleep(0.1) # テスト用に毎秒2回ループ
 
@@ -333,10 +425,24 @@ class WinchControllerV1:
         print("\r\nハードウェアを安全に停止しました。\r\n")
 
 
-
+# ==========================================
+# エントリーポイント
+# ==========================================
 if __name__ == "__main__":
-    app = WinchControllerV1()
+    parser = argparse.ArgumentParser(description="ウィンチコントローラー TCP サーバー")
+    parser.add_argument(
+        "--port", "-p",
+        type=int,
+        default=DEFAULT_PORT,
+        help=f"待受ポート番号 (デフォルト: {DEFAULT_PORT})"
+    )
+    args = parser.parse_args()
+ 
+    app = WinchControllerV1(port=args.port)
     try:
         app.run()
+    except KeyboardInterrupt:
+        print("\n[Main] Ctrl+C を検出しました。終了します...")
     finally:
         app.cleanup()
+ 
