@@ -26,9 +26,6 @@ PWM_REV_MAX        = 1345   # 逆転の最小値 (1% - 数字が大きいほど�
 PWM_REV_MIN        = 1000   # 逆転の最大値 (100% - 数字が小さいほど速い)
 
 
-ESTIMATED_ROT_PER_SEC = 0.2 # RPS
-WINCH_RADIUS = 0.10         # ドラム半径 (10cm)
-
 MAX_SPEED_M_MIN = 15.0
 
 DEFAULT_PORT = 8090
@@ -218,7 +215,6 @@ class WinchControllerV1:
         self.emergency = False          # 緊急停止フラグ
         self.target_pwm = STOP_center   # 目標の速度
         self.current_pwm = STOP_center  # 現在のモーターの速度
-        self.num_rotations = 0.0
         self.reached_full_speed = False #SLOW_down用
 
         # =====================
@@ -320,14 +316,6 @@ class WinchControllerV1:
                     self.current_pwm = max(self.current_pwm - step, self.target_pwm)
                 self.pi.set_servo_pulsewidth(PIN, self.current_pwm)
 
-
-            if self.current_pwm > STOP_fwd:
-                self.num_rotations -= (ESTIMATED_ROT_PER_SEC * 0.02)
-            elif self.current_pwm < STOP_rev:
-                self.num_rotations += (ESTIMATED_ROT_PER_SEC * 0.02)  
-                
-            if self.num_rotations < 0:
-                self.num_rotations = 0.0
             
             time.sleep(0.02)   
             
@@ -400,7 +388,6 @@ class WinchControllerV1:
                         if limit_switch_pressed:
                             self.target_pwm = STOP_center
                             self.cmd.run_flag = False
-                            self.num_rotations = 0.0
                             self.status.current_depth_m = 0.0
                             # エンコーダーもリセット
                             with self.encoder_lock:
