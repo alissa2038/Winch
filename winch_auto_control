@@ -232,6 +232,17 @@ class WinchControllerV1:
         self.pi.set_glitch_filter(SENSOR_PIN, 5000)  # ノイズによる誤カウントを防ぐ
         self.encoder_cb = None  # コールバックは run() 内でCSVを開いてからバインド
 
+        
+        # =====================
+        #   PID制御変数 (Nouveau)
+        # =====================
+        self.kp = 60.0  # Pゲイン: 誤差1mの時に60%の速度を要求する（要調整）
+        self.ki = 0.0   # Iゲイン: 過去の誤差の蓄積（今回は一旦0でOK）
+        self.kd = 5.0   # Dゲイン: 急激な変化を抑えるブレーキ（要調整）
+        self.prev_error = 0.0
+        self.integral = 0.0
+        self.last_pid_time = time.time()
+
 
         # モーター制御用のスレッドを開始
         threading.Thread(target=self.motor_loop, daemon=True).start()
