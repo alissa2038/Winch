@@ -9,7 +9,6 @@ import math
 import socket
 import json
 import argparse
-import csv
 
 # =====================
 #   ウインチ設定 (ハードウェア定数)
@@ -34,10 +33,10 @@ DEFAULT_PORT = 8090
 #   エンコーダー設定
 # =====================
 SENSOR_PIN             = 4              # 緑のケーブルのGPIOピン
-MAGNET_PAIRS           = 2             # ロータリーエンコーダーの磁石ペア数
+MAGNET_PAIRS           = 4             # ロータリーエンコーダーの磁石ペア数
 WHEEL_DIAMETER_MM      = 32            # ホイールの直径（mm）
 WHEEL_CIRCUMFERENCE_MM = math.pi * WHEEL_DIAMETER_MM  # 1回転あたり約100.53 mm
-ENCODER_CSV_FILENAME   = 'peak_measurements.csv'
+ENCODER_TIMEOUT_S      = 5.0            # この秒数パルスがなければエンコーダー異常と判断
 
 
 # ==========================================
@@ -190,6 +189,19 @@ def process_command(raw_json: str, controller) -> str:
     # --------------------------------------------------
     # 不明なコマンド
     # --------------------------------------------------
+    
+    elif command == "emergency_stop":
+        controller.target_pwm = STOP_center
+        controller.cmd.run_flag = False
+        controller.integral = 0.0
+        controller.prev_error = 0.0
+        controller.emergency = True  # motor_loopも即停止
+        return json.dumps({"status": "ok", "action": "emergency_stop"})
+ 
+    elif command == "emergency_reset":
+        controller.emergency = False  # 緊急停止解除
+        return json.dumps({"status": "ok", "action": "emergency_reset"})
+    
     else:
         return json.dumps({"status": "error", "error": f"unknown command: {command!r}"})
 
@@ -215,7 +227,6 @@ class WinchControllerV1:
         self.emergency = False          # 緊急停止フラグ
         self.target_pwm = STOP_center   # 目標の速度
         self.current_pwm = STOP_center  # 現在のモーターの速度
-        self.reached_full_speed = False #SLOW_down用
 
         # =====================
         #   エンコーダー変数
@@ -223,8 +234,7 @@ class WinchControllerV1:
         self.encoder_lock = threading.Lock()
         self.pulse_count = 0
         self.encoder_start_time = time.monotonic()
-        self.encoder_writer = None
-        self.encoder_csv_file = None
+        self.last_pulse_time = time.monotonic()  # エンコーダー異常検知用
  
         # エンコーダーセンサーの初期化（pigpio使用）
         self.pi.set_mode(SENSOR_PIN, pigpio.INPUT)
@@ -232,7 +242,6 @@ class WinchControllerV1:
         self.pi.set_glitch_filter(SENSOR_PIN, 5000)  # ノイズによる誤カウントを防ぐ
         self.encoder_cb = None  # コールバックは run() 内でCSVを開いてからバインド
 
-        
         # =====================
         #   PID制御変数 (Nouveau)
         # =====================
@@ -261,20 +270,16 @@ class WinchControllerV1:
     # =====================
     def detect_pulse(self, gpio, level, tick):  # pigpio コールバックは (gpio, level, tick) が必須
         with self.encoder_lock:
-            self.pulse_count += 1
+            if self.current_pwm > STOP_fwd:  # 巻き上げ中は減算
+                self.pulse_count -= 1
+                self.pulse_count = max(0, self.pulse_count)  # ← これを追加
+            else:                             # 繰り出し中は加算
+                self.pulse_count += 1
             revolutions = self.pulse_count / MAGNET_PAIRS
- 
-        elapsed_time = round(time.monotonic() - self.encoder_start_time, 3)
-        length_mm = round((revolutions - (1 / MAGNET_PAIRS)) * WHEEL_CIRCUMFERENCE_MM, 2)
+        self.last_pulse_time = time.monotonic()  # パルスのたびに更新
  
  
-        if self.encoder_writer is not None:
-            # [時間, 状態(0V), 回転数, 長さ(mm)] を書き込みます
-            self.encoder_writer.writerow([elapsed_time, 0, revolutions, length_mm])
-            # グラフを綺麗にするため、直後に立ち上がり（3.3V）をシミュレートします
-            self.encoder_writer.writerow([elapsed_time + 0.001, 3.3, revolutions, length_mm])
-            self.encoder_csv_file.flush()
-
+ 
     # =====================
     #   速度(%)をPWM値に変換する関数
     # =====================
@@ -312,6 +317,10 @@ class WinchControllerV1:
                 
             else:
                 step = 1   #ゆっくり加速
+
+             # motor_loopの中、PWMを変更する直前に追加
+            if self.current_pwm == STOP_center and self.target_pwm != STOP_center:
+                self.last_pulse_time = time.monotonic()  # 動き始めのタイミングでリセット
             
             if self.current_pwm < self.target_pwm:
                 if self.target_pwm >= STOP_fwd and (STOP_rev <= self.current_pwm < STOP_fwd):
@@ -327,7 +336,6 @@ class WinchControllerV1:
                     self.current_pwm = max(self.current_pwm - step, self.target_pwm)
                 self.pi.set_servo_pulsewidth(PIN, self.current_pwm)
 
-            
             time.sleep(0.02)   
             
     def get_simulated_depth(self):
@@ -350,125 +358,132 @@ class WinchControllerV1:
         )
         server_thread.start()
 
-        # エンコーダーCSVを開いてから割り込みを有効にする
-        with open(ENCODER_CSV_FILENAME, mode='w', newline='') as f:
-            self.encoder_csv_file = f
-            self.encoder_writer = csv.writer(f)
-            self.encoder_writer.writerow(['Time (s)', 'Voltage (V)', 'Cumulative Revolutions', 'Cable Length (mm)'])
-            self.encoder_writer.writerow([0, 3.3, 0, 0])
-            # FALLING_EDGE監視の開始
-            self.encoder_cb = self.pi.callback(SENSOR_PIN, pigpio.FALLING_EDGE, self.detect_pulse)
- 
-            print("ウィンチ待機中... (Ctrl+C で終了)")
-    
-            # メインループ 
-            while self.running:
+        
+        # FALLING_EDGE監視の開始
+        self.encoder_cb = self.pi.callback(SENSOR_PIN, pigpio.FALLING_EDGE, self.detect_pulse)
+
+        print("ウィンチ待機中... (Ctrl+C で終了)")
+
+        # メインループ 
+        while self.running:
+            
+            # --------------------------------------------------
+            # エンコーダーが実測値を持っていない場合のみ推定深度を使う
+            # --------------------------------------------------
+            if self.status.depth_estimated_flag:
                 self.status.current_depth_m = self.get_simulated_depth()
-                # 推定フラグ: 今はすべて推定値 (LiDAR実装後に切り替える)
-                self.status.depth_estimated_flag = True
-    
-                # ---------------------------------------------------------
-                # 状態遷移マシン
-                # ---------------------------------------------------------
-                
-                if not self.cmd.run_flag: # サーバーから停止要求があった場合
-                    # 完全に停止(1400)するまで SOFT_STOP を維持する
-                    if self.current_pwm != STOP_center:
-                        self.status.state_name = "SOFT_STOP"
-                        self.status.run_flag = True # 物理的に停止するまではTrueを維持
-                        # モーターに停止を指示 (実際の滑らかな減速はmotor_loopが行う)
-                        self.target_pwm = STOP_center 
-                        
-                    else:
-                        self.status.state_name = "IDLE"
-                        self.status.run_flag = False # 完全に停止
-                        self.target_pwm = STOP_center # 念のため停止を維持
-                        self.reached_full_speed = False  #IDLEに戻った時にリセット
-                        
-                elif self.cmd.run_flag:
-                    # サーバーから動作要求があった場合
-                    if self.cmd.target_depth_m == 0:
-                        self.status.state_name = "RETRIEVE_TO_HOME"
-                        self.status.run_flag = True
-    
-                        depth = self.status.current_depth_m
-                        slowdown_zone = 2.0
-                        # リミットスイッチまで巻き上げるコード
-                        limit_switch_pressed = (depth <= 0.1)
-    
-                        if limit_switch_pressed:
-                            self.target_pwm = STOP_center
-                            self.cmd.run_flag = False
-                            self.status.current_depth_m = 0.0
-                            # エンコーダーもリセット
-                            with self.encoder_lock:
-                                self.pulse_count = 0
-                            self.encoder_start_time = time.monotonic()
-                        else:
-                            # 残りの距離によって速度が変わる
-                            if depth > slowdown_zone:
-                                self.target_pwm = self.calculate_pwm('fwd', self.cmd.rate)
-                            else:
-                                self.target_pwm = self.calculate_pwm('fwd', 1)
-                        
-                        
-                    else :
-                        self.status.state_name = "TRACKING"
-                        self.status.run_flag = True
-                        target = self.cmd.target_depth_m
-                        depth = self.status.current_depth_m
-                        diff = target - depth
-                        abs_diff = abs(diff)
-    
-                        tolerance = 0.2  # 許容誤差（0.2m以内に来たら停止）
-                        slowdown_zone = 2.0
-                        
-                        if abs(diff) <= tolerance:
-                            self.target_pwm = STOP_center
-                            self.cmd.run_flag = False
-                            
-                        else:
-                            # === 2段階制御  ===
-                            if abs_diff <= slowdown_zone:
-                                # 減速ゾーン: どんな速度で来ていても、安全な最低速度(クリープ速度)固定
-                                active_rate =  1
-                                if self.reached_full_speed:  # 一度でも全速で走ったことがある場合のみ
-                                    self.status.state_name = "SLOW_DOWN"
-                                else:
-                                    self.status.state_name = "TRACKING"
-                            else:
-                                # 通常ゾーン: サーバーからの要求速度
-                                active_rate = self.cmd.rate
-                                self.reached_full_speed = True    # 通常ゾーンを通過した記録
-                                self.status.state_name = "TRACKING"
-    
-                            # 決定した速度(active_rate)でモーターに指示を出す
-                            if diff > 0:
-                                self.target_pwm = self.calculate_pwm('rev', active_rate) 
-                            elif diff < 0:
-                                self.target_pwm = self.calculate_pwm('fwd', active_rate)
-    
-                # ---------------------------------------------------------
-                # 実際のPWMからリアルタイムな速度を計算する
-                # ---------------------------------------------------------
-                if self.current_pwm == STOP_center:
-                    self.status.speed = 0
+
+            # --------------------------------------------------
+            # エンコーダー異常検知: モーターが動いているのにパルスがない
+            # --------------------------------------------------
+            if self.current_pwm != STOP_center and not self.emergency:
+                if time.monotonic() - self.last_pulse_time > ENCODER_TIMEOUT_S:
+                    self.target_pwm = STOP_center
+                    self.cmd.run_flag = False
+                    self.integral = 0.0
+                    self.prev_error = 0.0
+                    self.status.state_name = "ENCODER_ERROR"
+                    self.last_pulse_time = time.monotonic()  #（連投防止）
+                    print("\n[ERROR] エンコーダー無応答 - 緊急停止")
+
+            # ---------------------------------------------------------
+            # 状態遷移マシン
+            # ---------------------------------------------------------
+            
+            if not self.cmd.run_flag: # サーバーから停止要求があった場合
+                # 完全に停止(1400)するまで SOFT_STOP を維持する
+                if self.current_pwm != STOP_center:
+                    self.status.state_name = "SOFT_STOP"
+                    self.status.run_flag = True # 物理的に停止するまではTrueを維持
+                    # モーターに停止を指示 (実際の滑らかな減速はmotor_loopが行う)
+                    self.target_pwm = STOP_center 
+                    
                 else:
-                    # 加速中も減速中も、実際のモーターのPWMを見て速度を逆算する
-                    approx_rate = abs(self.current_pwm - STOP_center) / 600.0
-                    self.status.speed = int(approx_rate * (MAX_SPEED_M_MIN * 10))
-    
-                # 状態の表示 (サーバーへ返送されるデータのシミュレーション)
-                print(
-                    f"\r\033[K[Winch] 状態: {self.status.state_name:<15} | "
-                    f"PWM: {self.current_pwm} | "
-                    f"深度: {self.status.current_depth_m:>5.2f}m | "
-                    f"目標: {self.cmd.target_depth_m:>5.2f}m | "
-                    f"速度: {self.status.speed}",
-                    end="", flush=True
-                )
-                
-                time.sleep(0.1) # テスト用に毎秒2回ループ
+                    self.status.state_name = "IDLE"
+                    self.status.run_flag = False # 完全に停止
+                    self.target_pwm = STOP_center # 念のため停止を維持
+                    
+            elif self.cmd.run_flag:
+                # サーバーから動作要求があった場合
+                if self.cmd.target_depth_m == 0:
+                    self.status.state_name = "RETRIEVE_TO_HOME"
+                    self.status.run_flag = True
+
+                    depth = self.status.current_depth_m
+                    slowdown_zone = 2.0
+                    # リミットスイッチまで巻き上げるコード
+                    limit_switch_pressed = (depth <= 0.1)
+
+                    if limit_switch_pressed:
+                        self.target_pwm = STOP_center
+                        self.cmd.run_flag = False
+                        self.status.current_depth_m = 0.0
+                        # エンコーダーもリセット
+                        with self.encoder_lock:
+                            self.pulse_count = 0
+                        self.encoder_start_time = time.monotonic()
+                    else:
+                        # 残りの距離によって速度が変わる
+                        if depth > slowdown_zone:
+                            self.target_pwm = self.calculate_pwm('fwd', self.cmd.rate)
+                        else:
+                            self.target_pwm = self.calculate_pwm('fwd', 1)
+                    
+                    
+                else :
+                    self.status.state_name = "TRACKING"
+                    self.status.run_flag = True
+                    target = self.cmd.target_depth_m
+                    depth = self.status.current_depth_m
+                    diff = target - depth
+
+                    tolerance = 0.2  # 許容誤差（0.2m以内に来たら停止）
+                    
+                    if abs(diff) <= tolerance:
+                        self.target_pwm = STOP_center
+                        self.cmd.run_flag = False
+                        self.integral = 0.0      # 停止時にI項をリセット
+                        self.prev_error = 0.0
+                    
+                    else:
+                        # --- PID計算 ---
+                        now = time.time()
+                        dt = now - self.last_pid_time
+                        self.last_pid_time = now
+
+                        self.integral += diff * dt
+                        derivative = (diff - self.prev_error) / dt if dt > 0 else 0.0
+                        self.prev_error = diff
+
+                        output = self.kp * diff + self.ki * self.integral + self.kd * derivative
+                        active_rate = max(1, min(self.cmd.rate, abs(output)))
+
+                        if diff > 0:
+                            self.target_pwm = self.calculate_pwm('rev', active_rate)
+                        elif diff < 0:
+                            self.target_pwm = self.calculate_pwm('fwd', active_rate)
+
+            # ---------------------------------------------------------
+            # 実際のPWMからリアルタイムな速度を計算する
+            # ---------------------------------------------------------
+            if self.current_pwm == STOP_center:
+                self.status.speed = 0
+            else:
+                # 加速中も減速中も、実際のモーターのPWMを見て速度を逆算する
+                approx_rate = abs(self.current_pwm - STOP_center) / 600.0
+                self.status.speed = int(approx_rate * (MAX_SPEED_M_MIN * 10))
+
+            # 状態の表示 (サーバーへ返送されるデータのシミュレーション)
+            print(
+                f"\r\033[K[Winch] 状態: {self.status.state_name:<15} | "
+                f"PWM: {self.current_pwm} | "
+                f"深度: {self.status.current_depth_m:>5.2f}m | "
+                f"目標: {self.cmd.target_depth_m:>5.2f}m | "
+                f"速度: {self.status.speed}",
+                end="", flush=True
+            )
+            
+            time.sleep(0.1) # テスト用に毎秒2回ループ
 
     # プログラム終了時の安全な後処理
     def cleanup(self):
