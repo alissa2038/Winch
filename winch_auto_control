@@ -14,18 +14,16 @@ import argparse
 #   ウインチ設定 (ハードウェア定数)
 # =====================
 PIN                = 18
-STOP_fwd           = 1440
+STOP_fwd           = 1444   #1445で動き出す
 STOP_center        = 1400
-STOP_rev           = 1370
+STOP_rev           = 1360   #1359で繰り出し出す
 
 
-PWM_FWD_MIN        = 1455   # 正転の最小値 (1%)
+PWM_FWD_MIN        = 1450   # 正転の最小値 (1%)
 PWM_FWD_MAX        = 1800   # 正転の最大値 (100%)
-PWM_REV_MAX        = 1345   # 逆転の最小値 (1% - 数字が大きいほど遅い)
+PWM_REV_MAX        = 1350   # 逆転の最小値 (1% - 数字が大きいほど遅い)
 PWM_REV_MIN        = 1000   # 逆転の最大値 (100% - 数字が小さいほど速い)
 
-
-MAX_SPEED_M_MIN = 15.0
 
 DEFAULT_PORT = 8090
 
@@ -36,7 +34,9 @@ SENSOR_PIN             = 4              # 緑のケーブルのGPIOピン
 MAGNET_PAIRS           = 4             # ロータリーエンコーダーの磁石ペア数
 WHEEL_DIAMETER_MM      = 32            # ホイールの直径（mm）
 WHEEL_CIRCUMFERENCE_MM = math.pi * WHEEL_DIAMETER_MM  # 1回転あたり約100.53 mm
-ENCODER_TIMEOUT_S      = 5.0            # この秒数パルスがなければエンコーダー異常と判断
+ENCODER_TIMEOUT_S      = 1.0            # この秒数パルスがなければエンコーダー異常と判断
+STATE_FILE             = 'winch_state.json'  # 状態保存ファイル
+
 
 
 # ==========================================
@@ -154,7 +154,7 @@ def process_command(raw_json: str, controller) -> str:
         # depth: 精度0.1m → ×10 して uint16 で返す (例: 1.5m → 15)
         depth_encoded = int(round(status.current_depth_m * 10))
         # speed: 精度0.1m/min → ×10 して uint16 で返す
-        speed_encoded = int(status.speed)
+        speed_encoded = status.speed
  
         response = {
             "state":        1 if status.run_flag else 0,
@@ -252,6 +252,12 @@ class WinchControllerV1:
         self.integral = 0.0
         self.last_pid_time = time.time()
 
+        # =====================
+        #   状態の読み込み
+        # =====================
+        self.last_save_time = time.monotonic()
+        self._load_state()
+
 
         # モーター制御用のスレッドを開始
         threading.Thread(target=self.motor_loop, daemon=True).start()
@@ -266,17 +272,51 @@ class WinchControllerV1:
         time.sleep(0.5)  # ESCアーミング待ち
 
     # =====================
+    #   状態の保存・読み込み
+    # =====================
+    def _load_state(self):
+        try:
+            with open(STATE_FILE, 'r') as f:
+                data = json.load(f)
+            self.pulse_count        = data.get('pulse_count', 0)
+            self.cmd.target_depth_m = data.get('target_depth_m', 0.0)
+            self.cmd.rate           = data.get('rate', 20)
+        except (FileNotFoundError, json.JSONDecodeError):
+            print("[State] 保存ファイルなし。デフォルト値で起動します。")
+ 
+    def _save_state(self):
+        try:
+            with self.encoder_lock:
+                pc = self.pulse_count
+            data = {
+                'pulse_count':    pc,
+                'target_depth_m': self.cmd.target_depth_m,
+                'rate':           self.cmd.rate,
+            }
+            with open(STATE_FILE, 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f"\n[State] 保存エラー: {e}")
+
+    # =====================
     #   エンコーダー割り込み関数
     # =====================
     def detect_pulse(self, gpio, level, tick):  # pigpio コールバックは (gpio, level, tick) が必須
+        now = time.monotonic()
+        dt = now - self.last_pulse_time
         with self.encoder_lock:
             if self.current_pwm > STOP_fwd:  # 巻き上げ中は減算
                 self.pulse_count -= 1
                 self.pulse_count = max(0, self.pulse_count)  # ← これを追加
             else:                             # 繰り出し中は加算
                 self.pulse_count += 1
-            revolutions = self.pulse_count / MAGNET_PAIRS
-        self.last_pulse_time = time.monotonic()  # パルスのたびに更新
+        
+            distance_per_pulse_m = (WHEEL_CIRCUMFERENCE_MM / 1000.0) / MAGNET_PAIRS
+            if dt > 0:
+                speed_m_per_min = (distance_per_pulse_m / dt) * 60.0
+                self.status.speed = int(round(speed_m_per_min * 10))
+
+        self.last_pulse_time = now  # パルスのたびに更新
  
  
  
@@ -410,9 +450,9 @@ class WinchControllerV1:
                     self.status.run_flag = True
 
                     depth = self.status.current_depth_m
-                    slowdown_zone = 2.0
+                    slowdown_zone = 1.5
                     # リミットスイッチまで巻き上げるコード
-                    limit_switch_pressed = (depth <= 0.1)
+                    limit_switch_pressed = (depth <= 0.1)       #エンドスイッチを再現
 
                     if limit_switch_pressed:
                         self.target_pwm = STOP_center
@@ -427,7 +467,7 @@ class WinchControllerV1:
                         if depth > slowdown_zone:
                             self.target_pwm = self.calculate_pwm('fwd', self.cmd.rate)
                         else:
-                            self.target_pwm = self.calculate_pwm('fwd', 1)
+                            self.target_pwm = self.calculate_pwm('fwd', 10)
                     
                     
                 else :
@@ -437,7 +477,7 @@ class WinchControllerV1:
                     depth = self.status.current_depth_m
                     diff = target - depth
 
-                    tolerance = 0.2  # 許容誤差（0.2m以内に来たら停止）
+                    tolerance = 0.05  # 許容誤差（0.2m以内に来たら停止）
                     
                     if abs(diff) <= tolerance:
                         self.target_pwm = STOP_center
@@ -462,17 +502,13 @@ class WinchControllerV1:
                             self.target_pwm = self.calculate_pwm('rev', active_rate)
                         elif diff < 0:
                             self.target_pwm = self.calculate_pwm('fwd', active_rate)
-
+            
             # ---------------------------------------------------------
-            # 実際のPWMからリアルタイムな速度を計算する
+            # 状態の表示
             # ---------------------------------------------------------
             if self.current_pwm == STOP_center:
                 self.status.speed = 0
-            else:
-                # 加速中も減速中も、実際のモーターのPWMを見て速度を逆算する
-                approx_rate = abs(self.current_pwm - STOP_center) / 600.0
-                self.status.speed = int(approx_rate * (MAX_SPEED_M_MIN * 10))
-
+        
             # 状態の表示 (サーバーへ返送されるデータのシミュレーション)
             print(
                 f"\r\033[K[Winch] 状態: {self.status.state_name:<15} | "
@@ -482,6 +518,10 @@ class WinchControllerV1:
                 f"速度: {self.status.speed}",
                 end="", flush=True
             )
+            # 状態の定期保存（5秒ごと）
+            if time.monotonic() - self.last_save_time >= 5.0:
+                self._save_state()
+                self.last_save_time = time.monotonic()
             
             time.sleep(0.1) # テスト用に毎秒2回ループ
 
@@ -489,6 +529,7 @@ class WinchControllerV1:
     def cleanup(self):
         self.running = False
         time.sleep(0.5)
+        self._save_state()  # 終了時に保存
         if hasattr(self, 'encoder_cb') and self.encoder_cb:
             self.encoder_cb.cancel()  # pigpio コールバックを解除
         if hasattr(self, 'pi') and self.pi.connected:
