@@ -560,4 +560,3 @@ if __name__ == "__main__":
         print("\n[Main] Ctrl+C を検出しました。終了します...")
     finally:
         app.cleanup()
- 
