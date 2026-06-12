@@ -241,8 +241,8 @@ class WinchController:
             # 1秒後に redraw_status を実行するタイマーをスタート！
             self.msg_timer = threading.Timer(1.0, self.redraw_status)
             self.msg_timer.start()
-
-
+ 
+  
     # =====================
     #   手動モード
     # =====================
