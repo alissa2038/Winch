@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""
+ウインチ制御 + LiDAR緊急停止 + エンコーダーCSV記録
+起動時に手動モード
+
+共通:
+  スペース      : 一時停止 / 再開
+  s             : 終了（この時にCSVが保存されます）
+  r             : 緊急停止解除
+  LiDAR差 DIFF_THRESHOLD 以上 : 緊急停止
+  LiDAR異常値                 : 緊急停止
+
+エンコーダー:
+  ホイールが回るたびにパルスを検出し、peak_measurements.csv に
+  時間・電圧(疑似)・累積回転数・ケーブル長を記録します。
+  プログラム終了時（s / cleanup）にファイルが確定・保存されます。
+"""
+
+import sys
+import tty
+import termios
+import pigpio
+import threading
+import time
+import smbus
+import select as _select
+import math
+import csv
+from gpiozero import DigitalInputDevice
+
+# =====================
+#   ウインチ設定 (Constantes globales)
+# =====================
+PIN                = 18
+STOP_fwd           = 1444   #1445で動き出す
+STOP_center        = 1400
+STOP_rev           = 1360   #1359で繰り出し出す
+FWD_DEFAULT        = 1455   # 正転デフォルト（巻き取り）
+REV_DEFAULT        = 1350   # 逆転デフォルト（繰り出し）
+PWM_FWD_MIN        = 1450   # 正転の最小値 (1%)
+PWM_FWD_MAX        = 1800   # 正転の最大値 (100%)
+PWM_REV_MAX        = 1350   # 逆転の最小値 (1% - 数字が大きいほど遅い)
+PWM_REV_MIN        = 1000   # 逆転の最大値 (100% - 数字が小さいほど速い)
+
+SPEED_STEP         = 10     # q/a で変化する速度ステップ (us)
+
+# =====================
+#   LiDARセンサー設定
+# =====================
+LIDAR_ADDRESS  = 0x66  # LiDARセンサーのアドレス
+SENSOR_HZ      = 10    # 測定頻度 (回/秒)
+DIFF_THRESHOLD = 10    # この差(cm)以上で緊急停止
+VALID_MIN      = 2     # これ以下は異常値(cm)
+VALID_MAX      = 800   # これ以上は異常値(cm)
+
+# =====================
+#   エンコーダー / CSV設定
+# =====================
+ENCODER_PIN            = 4                       # 緑のケーブルのGPIOピン
+MAGNET_PAIRS           = 2
+CSV_FILENAME           = 'peak_measurements.csv'
+WHEEL_DIAMETER_MM      = 32                      # ホイールの直径（mm）
+WHEEL_CIRCUMFERENCE_MM = math.pi * WHEEL_DIAMETER_MM  # 1回転あたり約100.53 mm
+ENCODER_SAMPLE_HZ      = 200                     # 電圧の連続サンプリング頻度 (回/秒)
+
+
+class WinchController:
+    def __init__(self):
+        # =====================
+        #   pigpio 初期化  PWM用ライブラリ
+        # =====================
+        self.pi = pigpio.pi()
+        if not self.pi.connected:
+            print("pigpiod が起動していません: sudo pigpiod")
+            sys.exit()
+
+        # =====================
+        #   状態変数 
+        # =====================
+        self.fd = sys.stdin.fileno()  # ターミナル関係
+        self.old = termios.tcgetattr(self.fd)
+    
+        self.running = True
+        self.current_distance = None
+        self.emergency = False   # 緊急停止中フラグ
+
+        self.fwd_speed = FWD_DEFAULT
+        self.rev_speed = REV_DEFAULT
+        self.current_direction = None   # 'fwd' / 'rev' / None
+        self.paused_direction = None
+        self.msg_timer = None
+
+        self.target_pwm = STOP_center  # 目標の速度
+        self.current_pwm = STOP_center  # 現在のモーターの速度
+
+        self.sensor_connected = False
+
+        # =====================
+        #   エンコーダー / CSV 初期化
+        # =====================
+        self.encoder_lock = threading.Lock()
+        self.pulse_count = 0
+        self.encoder_start_time = time.monotonic()
+        self.csv_file = None
+        self.csv_writer = None
+
+        try:
+            self.csv_file = open(CSV_FILENAME, mode='w', newline='')
+            self.csv_writer = csv.writer(self.csv_file)
+            self.csv_writer.writerow(['Time (s)', 'Voltage (V)'])
+            self.csv_writer.writerow([0, 3.3])
+
+            # ファイルの準備ができたので、割り込み（パルス数カウント用）をバインドします
+            self.encoder = DigitalInputDevice(ENCODER_PIN, pull_up=True, bounce_time=0.005)
+            self.encoder.when_deactivated = self.detect_pulse
+
+            # 電圧を連続的に記録するスレッド（グラフが本物の矩形波になるように）
+            threading.Thread(target=self.encoder_sample_loop, daemon=True).start()
+        except Exception as e:
+            print(f"⚠️ エンコーダー/CSV初期化エラー: {e}")
+            self.encoder = None
+
+        # スレッドの開始 
+        threading.Thread(target=self.sensor_loop, daemon=True).start()
+        threading.Thread(target=self.motor_loop, daemon=True).start()
+        
+
+        
+        tty.setraw(self.fd)
+        self.pi.set_servo_pulsewidth(PIN, STOP_center)
+
+    # =====================
+    #   エンコーダー割り込み（パルス検出 → CSVに記録、ターミナルには何も表示しない）
+    # =====================
+    def detect_pulse(self):
+        # Ne sert plus qu'à compter les pics (pour le résumé final).
+        # L'écriture dans le CSV se fait en continu via encoder_sample_loop.
+        with self.encoder_lock:
+            self.pulse_count += 1
+
+    # =====================
+    #   エンコーダー：電圧の連続記録（矩形波としてグラフ化できるように）
+    # =====================
+    def encoder_sample_loop(self):
+        while self.running:
+            if self.csv_writer is not None and self.encoder is not None:
+                try:
+                    elapsed_time = round(time.monotonic() - self.encoder_start_time, 4)
+                    voltage = 0 if self.encoder.is_active else 3.3
+                    with self.encoder_lock:
+                        self.csv_writer.writerow([elapsed_time, voltage])
+                except Exception:
+                    pass
+            time.sleep(1.0 / ENCODER_SAMPLE_HZ)
+
+    # =====================
+    #   緊急停止
+    # =====================
+    def emergency_stop(self, reason):
+        if self.emergency:
+            return   # すでに停止中なら何もしない
+        self.emergency = True    # フラグON → キー入力を無視・センサーチェックも無視
+
+        self.target_pwm = STOP_center    #STOPに戻しておく
+        self.current_pwm = STOP_center
+
+        self.current_direction = None
+        self.paused_direction = None
+
+        self.pi.set_servo_pulsewidth(PIN, STOP_center)
+        print(f"\r\033[K  🛑 緊急停止: {reason}"           , flush=True)
+        print(f"\r\n  解除するには r を押してください\r\n", flush=True)
+
+    # =====================
+    #   センサースレッド
+    # =====================
+    def sensor_loop(self):
+        try:
+            bus = smbus.SMBus(1)      #3と５のピンはI2Cバス1として機能するGPIOピン
+        except Exception:
+            return                    #I2Cがそもそも機能しない場合
+
+        while self.running:
+            try:
+                raw  = bus.read_word_data(LIDAR_ADDRESS, 0)
+                dist = ((raw & 0xFF) << 8) | ((raw >> 8) & 0xFF)    #バイト順が逆なので上下を入れ替える
+
+                if not self.sensor_connected:
+                    self.sensor_connected = True
+
+                # 緊急停止中はチェックしない
+                if self.emergency:
+                    time.sleep(1.0 / SENSOR_HZ)
+                    continue
+
+                # 異常値チェック
+                if dist < VALID_MIN or dist > VALID_MAX:
+                    self.emergency_stop(f"異常値 {dist}cm")
+                    time.sleep(1.0 / SENSOR_HZ)
+                    continue
+
+                # 差チェック
+                if self.current_distance is not None:    #値が存在するか確認
+                    diff = abs(dist - self.current_distance)
+                    if diff >= DIFF_THRESHOLD:
+                        self.emergency_stop(f"距離変化 {diff}cm ({self.current_distance} → {dist}cm)")
+                        self.current_distance = None            #ソナーが通り過ぎたときに再び緊急停止しないように
+                        continue
+
+                self.current_distance = dist
+
+            except Exception:
+                if self.sensor_connected:
+                    self.sensor_connected = False
+                self.current_distance = None
+
+            time.sleep(1.0 / SENSOR_HZ)
+
+    # =====================
+    #   モータースレッド（滑らかな加減速）
+    # =====================
+    def motor_loop(self):
+        while self.running:
+            # 緊急停止の時は、滑らかさ無視で即座にピタッと止める
+            if self.emergency:
+                self.current_pwm = STOP_center
+                self.pi.set_servo_pulsewidth(PIN, STOP_center)
+                time.sleep(0.1)
+                continue
+            
+            # 目標と現在の差をチェックして、5、または20ずつ近づける
+            if self.target_pwm in [STOP_center, STOP_fwd, STOP_rev]:
+                step = 15  #素早く停止
+            else:
+                step = 5   #ゆっくり加速
+            
+            if self.current_pwm < self.target_pwm:
+                # 正転へ向かう時、不感帯(1370〜1440未満)にいたら currentpwm = 1440 
+                if self.target_pwm >= STOP_fwd and (STOP_rev <= self.current_pwm < STOP_fwd):
+                    self.current_pwm = STOP_fwd
+                else:
+                    self.current_pwm = min(self.current_pwm + step, self.target_pwm)
+                self.pi.set_servo_pulsewidth(PIN, self.current_pwm)
+
+            elif self.current_pwm > self.target_pwm:
+                # 逆転へ向かう時、不感帯(1370より大きく1440以下)にいたら 1370 まで飛ぶ
+                if self.target_pwm <= STOP_rev and (STOP_rev < self.current_pwm <= STOP_fwd):
+                    self.current_pwm = STOP_rev
+                else:
+                    self.current_pwm = max(self.current_pwm - step, self.target_pwm)
+                self.pi.set_servo_pulsewidth(PIN, self.current_pwm)
+              
+            
+            # 0.02秒待つ（1秒間に50回更新 ＝ 滑らか)
+            time.sleep(0.02)
+
+    # =====================
+    #   キー入力
+    # =====================
+    def get_key(self):
+        #escを押してしまった場合、好きなキーを一度押したらリセットされます
+        ch = sys.stdin.read(1)
+        if ch == '\x1b':
+            ch2 = sys.stdin.read(1)   #'\x1b'に続きがある前提でreadする
+            if ch2 == '[':            #続きが　[　でない場合、押されたのはesc
+                ch3 = sys.stdin.read(1)
+                return ch + ch2 + ch3
+            else:
+                return ch + ch2   #escを押してしまった時用 (esc=\x1b)
+        return ch
+
+    # =====================
+    #   画面の再描画（3秒後に呼ばれる）
+    # =====================
+    def redraw_status(self):
+        # \033[K で行を綺麗に掃除してから、いまの状態を表示し直す
+        if self.paused_direction is not None:
+            print(f"\r\033[K  ⏸ 一時停止 (スペースで再開) ", end='', flush=True)
+        else:
+            print(f"\r\033[K  ■ 停止 (方向キーを押してください) ", end='', flush=True)
+
+    # =====================
+    #   速度変更（停止中・動作中どちらでも可）
+    # =====================
+    def change_speed(self, delta):
+        if self.current_direction == 'fwd':
+            # 巻き取り中 → fwd_speedだけ変更
+            self.fwd_speed = max(PWM_FWD_MIN, min(PWM_FWD_MAX, self.fwd_speed + delta))
+            self.target_pwm = self.fwd_speed
+            print(f"\r\033[K  ▲ 巻き取り中 ({self.fwd_speed}us) ", end='', flush=True)
+
+        elif self.current_direction == 'rev':
+            # 繰り出し中 → rev_speedだけ変更
+            self.rev_speed = max(PWM_REV_MIN, min(PWM_REV_MAX, self.rev_speed - delta))
+            self.target_pwm = self.rev_speed
+            print(f"\r\033[K  ▼ 繰り出し中 ({self.rev_speed}us) ", end='', flush=True)
+
+        else:
+            # 停止中 → 両方の設定値を変更
+            self.fwd_speed = max(PWM_FWD_MIN, min(PWM_FWD_MAX, self.fwd_speed + delta))
+            self.rev_speed = max(PWM_REV_MIN, min(PWM_REV_MAX, self.rev_speed - delta))
+            # 画面に速度変更のメッセージを表示
+            print(f"\r\033[K  速度設定 → 巻き取り: {self.fwd_speed}us  繰り出し: {self.rev_speed}us ", end='', flush=True)
+
+            # もし既にタイマーが動いていたら（連打した時）一旦キャンセル
+            if self.msg_timer:
+                self.msg_timer.cancel()
+            
+            # 1秒後に redraw_status を実行するタイマーをスタート！
+            self.msg_timer = threading.Timer(1.0, self.redraw_status)
+            self.msg_timer.start()
+ 
+  
+    # =====================
+    #   手動モード
+    # =====================
+    def manual_mode(self):
+        print(f"\r\n\n\n\n\n ---- 手動モード ---- \r\n")
+        print(f"\r   現在の速度 → 巻き取り: {self.fwd_speed}us  繰り出し: {self.rev_speed}us\r\n")   
+        print(f"\r  ┌────────────────── 手動モード ───────────────────┐\r\n")
+        print(f"\r  │  【↑】        巻き取り   【↓】 繰り出し         │\r\n")
+        print(f"\r  │  【スペース】 一時停止                          │\r\n")
+        print(f"\r  │  【q / a】    速度変更                          │\r\n")
+        print(f"\r  │  【s】        終了                              │\r\n")
+        print(f"\r  └─────────────────────────────────────────────────┘\r\n")
+        print(f"\r\n  ■ 停止 (方向キーを押して制御スタート) ", end='', flush=True)
+
+        while True:
+            key = self.get_key()
+
+            if key == 's':
+                self.target_pwm = STOP_center
+                self.current_direction = None
+                return 'quit'
+            
+            elif key == ' ':  # 一時停止
+                if self.current_direction is not None:
+                    # ①　ウインチ動いてる時 ->　一時停止して今の方向を記憶
+                    self.paused_direction = self.current_direction
+                    self.target_pwm = STOP_center
+                    self.current_direction = None
+                    print(f"\r\033[K  ⏸ 一時停止 (スペースで再開) ", end='', flush=True)
+                else:
+                    # ② 止まっている時 -> 記憶をもとに再開
+                    if self.paused_direction == 'fwd':
+                        self.current_direction = 'fwd'
+                        self.target_pwm = self.fwd_speed
+                        self.paused_direction = None  # 記憶をリセット
+                        print(f"\r\033[K  ▲ 巻き取り中 ({self.fwd_speed}us) ", end='', flush=True)
+                    elif self.paused_direction == 'rev':
+                        self.current_direction = 'rev'
+                        self.target_pwm = self.rev_speed
+                        self.paused_direction = None  # 記憶をリセット
+                        print(f"\r\033[K  ▼ 繰り出し中 ({self.rev_speed}us) ", end='', flush=True)
+                    else:
+                        # 記憶がない（起動直後など）場合は動かさない
+                        print(f"\r  ■ 停止 (方向キーを押して制御スタート) ", end='', flush=True)
+                
+            # 緊急停止中は r 以外のキーをすべて無視
+            if self.emergency:
+                if key == 'r':
+                    self.emergency = False
+                    print(f"\r  ✅ 操作を再開できます\r\n\n", flush=True)
+                    self.redraw_status()
+                continue
+
+            if key == '\x1b[A':   # ↑ 巻き取り開始
+                self.current_direction = 'fwd'
+                self.paused_direction = None   # 新しく矢印を押したら記憶はリセット
+                self.target_pwm = self.fwd_speed
+                print(f"\r\033[K  ▲ 巻き取り中 ({self.fwd_speed}us) ", end='', flush=True)
+
+            elif key == '\x1b[B':   # ↓ 繰り出し開始
+                self.current_direction = 'rev'
+                self.paused_direction = None   # 新しく矢印を押したら記憶はリセット
+                self.target_pwm = self.rev_speed
+                print(f"\r\033[K  ▼ 繰り出し中 ({self.rev_speed}us) ", end='', flush=True)
+
+            elif key == 'q':
+                self.change_speed(+SPEED_STEP)
+
+            elif key == 'a':
+                self.change_speed(-SPEED_STEP)
+
+    # =====================
+    #   メインループ
+    # =====================
+    def run(self):
+        while True:
+          result = self.manual_mode()
+          if result == 'quit':
+              break
+            
+
+    def cleanup(self):
+        self.running = False
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old)
+        if self.msg_timer:
+            self.msg_timer.cancel()
+        self.pi.set_servo_pulsewidth(PIN, STOP_center)
+        time.sleep(0.5)
+        self.pi.set_servo_pulsewidth(PIN, 0)
+        self.pi.stop()
+
+        # --- CSV確定・保存 ---
+        if self.csv_file is not None:
+            with self.encoder_lock:
+                total_pulses = self.pulse_count
+                self.csv_file.close()
+            print(f"\r\n'{CSV_FILENAME}'にパルスが保存されました。")
+            print(f"   (合計パルス数 : {total_pulses})\r\n")
+
+        print("\r\n終了\r\n")
+
+
+# =====================
+#   プログラム実行
+# =====================
+if __name__ == "__main__":
+    app = WinchController()
+    try:
+        app.run()
+    finally:
+        app.cleanup()
